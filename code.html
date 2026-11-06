@@ -1,0 +1,933 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Analysis code · Kayla Park</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/r.min.js"></script>
+<style>
+body{margin:0;background:#EEF5FB;color:#132238;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;line-height:1.6}
+.top{background:#10243D;color:#F2F7FC;padding:28px 0} .wrap{max-width:980px;margin:0 auto;padding:0 24px}
+h1{margin:0 0 6px;font-size:26px;font-weight:700} .top p{margin:0;color:#C9DAEC;font-size:15px;max-width:70ch}
+.top a{color:#BFD8EE} .back{display:inline-block;margin-bottom:14px;font-size:14px}
+.meta{background:#fff;border:1px solid #CFE0F0;border-radius:12px;padding:18px 22px;margin:24px 0;font-size:15px}
+.meta b{color:#10243D}
+pre{background:#fff;border:1px solid #CFE0F0;border-radius:12px;padding:18px 20px;overflow-x:auto;font-size:13px;line-height:1.5;margin:0 0 18px}
+h2{font-size:20px;margin:34px 0 10px;color:#10243D} h3{font-size:16px;margin:24px 0 8px;color:#1F4066}
+.md{font-size:15px;color:#3C4D62;max-width:76ch}
+</style></head><body>
+<div class="top"><div class="wrap"><a class="back" href="index.html">← Back to kaylapark</a><h1>Analysis code</h1>
+<p>The R Markdown file behind “Beyond the Facility Walls: A Geospatial Analysis on Supervised Consumption Sites and Its Neighborhood Effects” (Cho &amp; Park, <a href="https://nhsjs.com/2026/beyond-the-facility-walls-a-geospatial-analysis-on-supervised-consumption-sites-and-its-neighborhood-effects/">NHSJS Reports</a>, November 6, 2026). I wrote this code; the sections after “Additional analyses added during peer review” were added in response to the reviewers.</p></div></div>
+<div class="wrap">
+<div class="meta"><b>Download:</b> <a href="analysis.Rmd">analysis.Rmd</a> &nbsp;·&nbsp; <b>Packages:</b> tidyverse, sf, spdep, lubridate, readxl, fixest, clubSandwich, HonestDiD, car, ResourceSelection &nbsp;·&nbsp; <b>Data:</b> NYC Open Data (EMS Incident Dispatch 76xm-jjuj; 311 Service Requests erm2-nwe9, 76ig-c548), U.S. Census ACS and TIGER/Line ZCTA shapefiles</div>
+<pre><code class="language-r">knitr::opts_chunk$set(echo = FALSE)
+
+library(tidyverse)
+library(sf)
+library(spdep)
+library(lubridate)
+library(table1)
+library(readxl)
+library(knitr)</code></pre>
+<pre><code class="language-r">file_path &lt;- &quot;data/&quot;</code></pre>
+<pre><code class="language-r">syringe_2010 &lt;- read.csv(paste0(file_path, &quot;311_Service_Requests_from_2010.csv&quot;))
+syringe_2020 &lt;- read.csv(paste0(file_path, &quot;311_Service_Requests_from_2020.csv&quot;))
+df_scs &lt;- read_csv(&quot;data/scs_locations.csv&quot;)
+EMS &lt;- read.csv(paste0(file_path, &quot;EMS_Incident_Dispatch_Data.csv&quot;))</code></pre>
+<pre><code class="language-r"># NA clean for all datasets
+syringe_2010 &lt;- syringe_2010 %&gt;% 
+    drop_na(Longitude)
+
+syringe_2020 &lt;- syringe_2020 %&gt;% 
+    drop_na(Longitude)
+
+syringe &lt;- rbind(syringe_2010,syringe_2020)
+
+syringe &lt;- syringe %&gt;% 
+    mutate(
+        Created.Date = mdy(Created.Date)
+    )
+
+EMS &lt;- EMS %&gt;% 
+    mutate(INCIDENT_DATETIME = mdy(INCIDENT_DATETIME))</code></pre>
+<pre><code class="language-r"># Split data to pre and post sites
+
+pre_EMS &lt;- EMS %&gt;% 
+    filter((INCIDENT_DATETIME &lt; as.Date(&quot;2021-11-30&quot;) &amp; INCIDENT_DATETIME &gt; as.Date(&quot;2021-06-15&quot;)) | (INCIDENT_DATETIME &lt; as.Date(&quot;2020-03-01&quot;) &amp; INCIDENT_DATETIME &gt; as.Date(&quot;2018-07-15&quot;)))
+post_EMS &lt;- EMS %&gt;% 
+    filter(INCIDENT_DATETIME &gt; as.Date(&quot;2022-06-01&quot;) &amp; INCIDENT_DATETIME &lt; as.Date(&quot;2024-07-01&quot;))
+
+pre_syringe &lt;- syringe %&gt;% 
+    filter((Created.Date &lt; as.Date(&quot;2021-11-30&quot;) &amp; Created.Date &gt; as.Date(&quot;2021-06-15&quot;)) | (Created.Date &lt; as.Date(&quot;2020-03-01&quot;) &amp; Created.Date &gt; as.Date(&quot;2018-07-15&quot;)))
+post_syringe &lt;- syringe %&gt;% 
+    filter(Created.Date &gt; as.Date(&quot;2022-06-01&quot;) &amp; Created.Date &lt; as.Date(&quot;2023-02-15&quot;))</code></pre>
+<pre><code class="language-r">nyc_shp &lt;- read_sf(&quot;data/tl_2025_us_zcta520/tl_2025_us_zcta520.shp&quot;)
+nyc_shp &lt;- nyc_shp %&gt;% 
+    mutate(ZCTA5CE20 = as.numeric(ZCTA5CE20)) %&gt;% 
+    filter(ZCTA5CE20 &gt;= 10001 &amp; ZCTA5CE20 &lt;= 10282 &amp; ZCTA5CE20 != 10044 &amp; ZCTA5CE20 != 10177)
+nyc_shp &lt;- st_transform(nyc_shp, 32618)</code></pre>
+<pre><code class="language-r">pre_EMS_counts &lt;- pre_EMS %&gt;% 
+    count(ZIPCODE)
+pre_EMS_counts &lt;- pre_EMS_counts %&gt;% 
+    rename(pre_EMS_counts_per_zipcode = n) %&gt;% 
+    drop_na(pre_EMS_counts_per_zipcode)
+post_EMS_counts &lt;- post_EMS %&gt;% 
+    count(ZIPCODE)
+post_EMS_counts &lt;- post_EMS_counts %&gt;% 
+    rename(post_EMS_counts_per_zipcode = n) %&gt;% 
+    drop_na(post_EMS_counts_per_zipcode)
+</code></pre>
+<pre><code class="language-r">nyc_shp_EMS &lt;- nyc_shp %&gt;% 
+    left_join(pre_EMS_counts, by = join_by(ZCTA5CE20 == ZIPCODE)) %&gt;% 
+    mutate(pre_EMS_counts_per_zipcode = replace_na(pre_EMS_counts_per_zipcode, 0))
+nyc_shp_EMS &lt;- nyc_shp_EMS %&gt;% 
+    left_join(post_EMS_counts, by = join_by(ZCTA5CE20 == ZIPCODE)) %&gt;% 
+    mutate(post_EMS_counts_per_zipcode = replace_na(post_EMS_counts_per_zipcode, 0))
+nyc_shp_EMS &lt;- nyc_shp_EMS %&gt;% 
+    drop_na(pre_EMS_counts_per_zipcode, post_EMS_counts_per_zipcode)</code></pre>
+<pre><code class="language-r">zip_neighbors &lt;- poly2nb(nyc_shp_EMS)</code></pre>
+<pre><code class="language-r">lw &lt;- nb2listw(zip_neighbors, style = &quot;W&quot;)</code></pre>
+<pre><code class="language-r">moran &lt;- moran.test(nyc_shp_EMS$pre_EMS_counts_per_zipcode, lw)
+print(moran)
+moran_post &lt;- moran.test(nyc_shp_EMS$post_EMS_counts_per_zipcode, lw)
+print(moran_post)</code></pre>
+<pre><code class="language-r">pre_syringe_final &lt;- pre_syringe %&gt;% 
+    select(Latitude, Longitude) %&gt;% 
+    mutate(Period = &quot;Pre&quot;)
+post_syringe_final &lt;- post_syringe %&gt;% 
+    select(Latitude, Longitude) %&gt;% 
+    mutate(Period = &quot;Post&quot;)
+syringe_final &lt;- rbind(pre_syringe_final, post_syringe_final)</code></pre>
+<pre><code class="language-r">syringes_sf &lt;- st_as_sf(syringe_final, coords = c(&quot;Longitude&quot;, &quot;Latitude&quot;), crs = 4326)
+syringes_sf &lt;- st_transform(syringes_sf, 32618)</code></pre>
+<pre><code class="language-r">pre_syringe_counts &lt;- pre_syringe %&gt;% 
+    count(Incident.Zip) %&gt;% 
+    rename(pre_syringe_counts_per_zipcode = n) #%&gt;% 
+    #drop_na(pre_syringe_counts_per_zipcode)
+post_syringe_counts &lt;- post_syringe %&gt;% 
+    count(Incident.Zip) %&gt;% 
+    rename(post_syringe_counts_per_zipcode = n) #%&gt;% 
+    #drop_na(post_syringe_counts_per_zipcode)</code></pre>
+<pre><code class="language-r">nyc_shp_syringe &lt;- nyc_shp %&gt;% 
+    left_join(pre_syringe_counts, by = join_by(ZCTA5CE20 == Incident.Zip)) %&gt;% 
+    mutate(pre_syringe_counts_per_zipcode = replace_na(pre_syringe_counts_per_zipcode, 0))
+nyc_shp_syringe &lt;- nyc_shp_syringe %&gt;% 
+    left_join(post_syringe_counts, by = join_by(ZCTA5CE20 == Incident.Zip)) %&gt;%
+    mutate(post_syringe_counts_per_zipcode = replace_na(post_syringe_counts_per_zipcode, 0))
+nyc_shp_syringe &lt;- nyc_shp_syringe %&gt;% 
+    drop_na(pre_syringe_counts_per_zipcode, post_syringe_counts_per_zipcode)</code></pre>
+<pre><code class="language-r">zip_neighbors &lt;- poly2nb(nyc_shp_syringe)
+lw &lt;- nb2listw(zip_neighbors, style = &quot;W&quot;)
+moran &lt;- moran.test(nyc_shp_syringe$pre_syringe_counts_per_zipcode, lw)
+print(moran)
+moran_post &lt;- moran.test(nyc_shp_syringe$post_syringe_counts_per_zipcode, lw)
+print(moran_post)</code></pre>
+<pre><code class="language-r"># site zipcodes: 10033 and 10035
+
+df_scs &lt;- df_scs |&gt; 
+  filter(`Site Type` == &quot;SCS&quot;)
+sites_shp &lt;- st_as_sf(df_scs, coords=c(&quot;Longitude&quot;,&quot;Latitude&quot;), crs=4326)
+sites_shp &lt;- st_transform(sites_shp, 32618)
+sites_buffer_shp &lt;- st_buffer(sites_shp, dist=1000)
+sites_in_zip_shp &lt;- st_join(nyc_shp_EMS, sites_shp, join = st_contains)
+nyc_shp_EMS$has_site &lt;- !is.na(sites_in_zip_shp$`Site Type`)
+treated_zip_codes &lt;- nyc_shp_EMS$ZCTA5CE20[nyc_shp_EMS$has_site]</code></pre>
+<pre><code class="language-r">syringes_sf$treated &lt;- as.integer(lengths(st_within(syringes_sf, sites_buffer_shp)) &gt; 0)
+syringes_sf$Period &lt;- if_else(syringes_sf$Period==&quot;Pre&quot;, 0, 1)</code></pre>
+<pre><code class="language-r">did_data &lt;- syringes_sf %&gt;%
+  group_by(Period, treated) %&gt;%
+  summarise(events = n())</code></pre>
+<pre><code class="language-r">pop &lt;- t(as.data.frame(read_xlsx(paste0(file_path, &quot;population.xlsx&quot;), sheet=&quot;Data&quot;, col_names = F)))
+colnames(pop) &lt;- c(&quot;ZCTA5CE20&quot;,&quot;Population&quot;)
+pop &lt;- as.data.frame(pop)</code></pre>
+<pre><code class="language-r">nyc_shp_EMS &lt;- left_join(nyc_shp_EMS, pop, by=&quot;ZCTA5CE20&quot;)</code></pre>
+<pre><code class="language-r">nyc_shp_EMS &lt;- nyc_shp_EMS %&gt;% 
+    filter(Population &gt; 100) %&gt;% 
+    mutate(
+        all_ems_counts_by_zipcode = pre_EMS_counts_per_zipcode + post_EMS_counts_per_zipcode,
+        all_ems_rate = round(all_ems_counts_by_zipcode/Population * 10000, 2),
+        all_ems_counts_percentile = round(percent_rank(all_ems_counts_by_zipcode) * 100,2),
+        pre_ems_counts_percentile = round(percent_rank(pre_EMS_counts_per_zipcode * 100),2),
+        post_ems_counts_percentile = round(percent_rank(post_EMS_counts_per_zipcode * 100),2)
+    )</code></pre>
+<pre><code class="language-r">label(nyc_shp_EMS$all_ems_counts_percentile) &lt;- &quot;EMS Call Counts Percentile&quot;
+p_map &lt;- ggplot() +
+    geom_sf(data=nyc_shp_syringe) +
+    geom_sf(data=nyc_shp_EMS, aes(fill=all_ems_counts_percentile)) +
+    geom_sf(data=sites_buffer_shp, fill=NA, aes(color=&quot;SCS&quot;), linewidth=1.2) +
+    geom_sf(data=syringes_sf, aes(color=&quot;Syringe Complaints&quot;), size=0.5, alpha=.5) + 
+    scale_fill_distiller(name=&quot;EMS Calls Percentile&quot;,palette = &quot;YlOrRd&quot;, direction = 1) +
+    scale_color_manual(name=NULL,values=c(&quot;SCS&quot;=&#x27;#46CF21&#x27;, &quot;Syringe Complaints&quot;=&quot;black&quot;)) +
+    guides(fill  = guide_colorbar(order = 1),
+color = guide_legend(order = 2, override.aes = list(size = c(1.5, 3), alpha = c(1, 0.7)))
+) +
+    theme_minimal() + 
+    theme(
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        plot.background = element_blank(),
+        panel.grid.major = element_blank(),
+        legend.text = element_text(size=11)
+    )</code></pre>
+<pre><code class="language-r">ggsave(&quot;ems_map.png&quot;,
+width = 10, height = 8, units = &quot;in&quot;, dpi = 300, bg = &quot;white&quot;)</code></pre>
+<pre><code class="language-r">ggplot() +
+    geom_sf(data=nyc_shp_syringe) +
+    geom_sf(data=nyc_shp_EMS, aes(fill=pre_ems_counts_percentile)) +
+    geom_sf(data=sites_buffer_shp, fill=NA, color=&#x27;red&#x27;) +
+    geom_sf(data=syringes_sf[syringes_sf$Period==0,], size=0.5, alpha=.5) + 
+    scale_fill_distiller(palette = &quot;RdYlGn&quot;, direction = -1) +
+    theme_minimal() + 
+    theme(
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        plot.background = element_blank(),
+        panel.grid.major = element_blank()
+    )</code></pre>
+<pre><code class="language-r">ggplot() +
+    geom_sf(data=nyc_shp_syringe) +
+    geom_sf(data=nyc_shp_EMS, aes(fill=post_ems_counts_percentile)) +
+    geom_sf(data=sites_buffer_shp, fill=NA, color=&#x27;red&#x27;) +
+    geom_sf(data=syringes_sf[syringes_sf$Period==1,], size=0.5, alpha=.5) + 
+    scale_fill_distiller(palette = &quot;RdYlGn&quot;, direction = -1) +
+    theme_minimal() + 
+    theme(
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        plot.background = element_blank(),
+        panel.grid.major = element_blank()
+    )</code></pre>
+<pre><code class="language-r">model &lt;- glm(events ~ Period * treated, family = poisson, data = did_data)
+summary(model)</code></pre>
+<pre><code class="language-r">event_model &lt;- glm(Period ~ treated, data = syringes_sf, family = binomial)
+summary(event_model)
+print(exp(coef(event_model)))
+print(exp(confint(event_model)))</code></pre>
+<pre><code class="language-r">nb &lt;- poly2nb(nyc_shp_EMS)
+contig_list &lt;- unique(unlist(nb[which(nyc_shp_EMS$ZCTA5CE20 %in% treated_zip_codes)]))
+contiguous_zip_codes &lt;- nyc_shp_EMS$ZCTA5CE20[contig_list]
+nyc_shp_EMS$treated &lt;- nyc_shp_EMS$ZCTA5CE20 %in% c(treated_zip_codes, contiguous_zip_codes)</code></pre>
+<pre><code class="language-r">pre_EMS_counts_final &lt;- pre_EMS_counts[which(pre_EMS_counts$ZIPCODE %in% nyc_shp_EMS$ZCTA5CE20),] %&gt;% 
+    mutate(
+        period = &quot;Pre&quot;
+    ) %&gt;% 
+    rename(&quot;EMS_counts_per_zipcode&quot; = &quot;pre_EMS_counts_per_zipcode&quot;)
+
+post_EMS_counts_final &lt;- post_EMS_counts[which(post_EMS_counts$ZIPCODE %in% nyc_shp_EMS$ZCTA5CE20),] %&gt;% 
+    mutate(
+        period = &quot;Post&quot;
+    ) %&gt;% 
+    rename(&quot;EMS_counts_per_zipcode&quot; = &quot;post_EMS_counts_per_zipcode&quot;)
+EMS_counts_final &lt;- rbind(pre_EMS_counts_final, post_EMS_counts_final)</code></pre>
+<pre><code class="language-r">EMS_counts_final &lt;- left_join(EMS_counts_final, nyc_shp_EMS %&gt;% select(ZCTA5CE20, treated), by = join_by(ZIPCODE == ZCTA5CE20))</code></pre>
+<pre><code class="language-r">did_ems &lt;- EMS_counts_final %&gt;%
+  group_by(period, treated) %&gt;%
+  summarise(EMS_counts_per_zipcode = sum(EMS_counts_per_zipcode), .groups = &quot;drop&quot;)
+print(did_ems)</code></pre>
+<pre><code class="language-r">did_ems &lt;- did_ems %&gt;% 
+    mutate(period = factor(period, levels=c(&quot;Pre&quot;,&quot;Post&quot;)))
+model &lt;- glm(EMS_counts_per_zipcode ~ period * treated, family = poisson, data = did_ems)
+summary(model)</code></pre>
+<pre><code class="language-r">pre_EMS &lt;- pre_EMS %&gt;% 
+    mutate(period = &quot;Pre&quot;,
+           treated = ZIPCODE %in% c(treated_zip_codes, contiguous_zip_codes))
+post_EMS &lt;- post_EMS %&gt;% 
+    mutate(period = &quot;Post&quot;,
+           treated = ZIPCODE %in% c(treated_zip_codes, contiguous_zip_codes))
+all_EMS &lt;- rbind(pre_EMS %&gt;% select(ZIPCODE, period, treated), post_EMS %&gt;% select(ZIPCODE, period, treated))
+all_EMS &lt;- all_EMS %&gt;% 
+    mutate(
+        period = if_else(period == &quot;Pre&quot;, 0, 1),
+        treated = if_else(treated == TRUE, 1, 0)
+    )</code></pre>
+<pre><code class="language-r">event_model &lt;- glm(period ~ treated, data = all_EMS, family = binomial)
+summary(event_model)
+print(exp(coef(event_model)))
+print(exp(confint(event_model)))</code></pre>
+<pre><code class="language-r">insurance &lt;- t(readxl::read_xlsx(paste0(file_path, &quot;health_insurance.xlsx&quot;),sheet=&quot;Data&quot;))
+
+insurance &lt;- data.frame(insurance[-1,])
+insurance$zip &lt;- rownames(insurance)
+colnames(insurance) &lt;- c(&quot;Insured&quot;, &quot;Zip&quot;)
+insurance$Zip &lt;- as.integer(str_extract(insurance$Zip, &quot; \\d+&quot;))</code></pre>
+<pre><code class="language-r">race &lt;- t(readxl::read_xlsx(paste0(file_path, &quot;race.xlsx&quot;),sheet=&quot;Data&quot;))
+race &lt;- data.frame(race[-1,])
+
+colnames(race) &lt;- c(&quot;Total&quot;, &quot;White&quot;)
+race$zip &lt;- rownames(race)
+race &lt;- race %&gt;% 
+    mutate(
+        Total = as.integer(Total),
+        White = as.integer(White),
+        non_white = 1-White/Total,
+        zip = as.integer(zip)
+    )
+colnames(race) &lt;- c(&quot;Total&quot;, &quot;White&quot;,&quot;Zip&quot;,&quot;non_white&quot;)</code></pre>
+<pre><code class="language-r">poverty &lt;- t(readxl::read_xlsx(paste0(file_path, &quot;poverty.xlsx&quot;),sheet=&quot;Data&quot;))
+poverty &lt;- data.frame(poverty[-1,])
+poverty$zip &lt;- rownames(poverty)
+colnames(poverty) &lt;- c(&quot;Poverty_rate&quot;, &quot;Zip&quot;)
+poverty$Zip &lt;- as.integer(str_extract(poverty$Zip, &quot; \\d+&quot;))</code></pre>
+<pre><code class="language-r">age &lt;- t(readxl::read_xlsx(paste0(file_path, &quot;age.xlsx&quot;),sheet=&quot;Data&quot;))
+age &lt;- data.frame(age[-1,])
+age$Zip &lt;- rownames(age)
+colnames(age) &lt;- c(&quot;Median Age&quot;, &quot;Zip&quot;)
+
+age &lt;- age %&gt;% 
+    mutate(
+        `Median Age` = as.numeric(`Median Age`),
+        Zip = as.numeric(Zip)
+    )</code></pre>
+<pre><code class="language-r">close &lt;- EMS_counts_final %&gt;% 
+    filter(period==&quot;Pre&quot;)
+
+socioecon &lt;- left_join(race,insurance,by=&quot;Zip&quot;)
+socioecon &lt;- left_join(socioecon,poverty,by=&quot;Zip&quot;)
+socioecon &lt;- left_join(socioecon,age,by=&quot;Zip&quot;)
+
+close &lt;- left_join(close, socioecon, by=join_by(ZIPCODE == Zip))
+
+close_final &lt;- close %&gt;% 
+    select(c(treated,non_white,Insured,Poverty_rate,`Median Age`)) %&gt;% 
+    mutate(
+        treated = ifelse(treated==TRUE,1,0),
+        Insured = as.numeric(Insured),
+        Poverty_rate = as.numeric(Poverty_rate)
+    )</code></pre>
+<pre><code class="language-r">socio_model &lt;- glm(treated ~ non_white + Insured + Poverty_rate + `Median Age`, data = close_final, family = binomial)
+summary(socio_model)</code></pre>
+<pre><code class="language-r">non_white_model &lt;- glm(treated ~ non_white, data = close_final, family = binomial)
+summary(non_white_model)</code></pre>
+<pre><code class="language-r">insured_model &lt;- glm(treated ~ Insured, data = close_final, family = binomial)
+summary(insured_model)</code></pre>
+<pre><code class="language-r">poverty_model &lt;- glm(treated ~ Poverty_rate, data = close_final, family = binomial)
+summary(poverty_model)</code></pre>
+<pre><code class="language-r">age_model &lt;- glm(treated ~ `Median Age`, data = close_final, family = binomial)
+summary(age_model)</code></pre>
+<pre><code class="language-r">null_model &lt;- glm(treated ~ 1, data = close_final[!(is.na(close_final$non_white)),], family = binomial)</code></pre>
+<pre><code class="language-r">anova(null_model, socio_model, test=&#x27;Chisq&#x27;)</code></pre>
+<pre><code class="language-r">poverty_p &lt;- summary(poverty_model)$coefficients[,&quot;Pr(&gt;|z|)&quot;][2]
+non_white_p &lt;- summary(non_white_model)$coefficients[,&quot;Pr(&gt;|z|)&quot;][2]
+insured_p &lt;- summary(insured_model)$coefficients[,&quot;Pr(&gt;|z|)&quot;][2]
+age_p &lt;- summary(age_model)$coefficients[,&quot;Pr(&gt;|z|)&quot;][2]</code></pre>
+<pre><code class="language-r">logit_p &lt;- c(non_white_p, insured_p, poverty_p, age_p)</code></pre>
+<pre><code class="language-r">p.adjust(logit_p,method=&quot;bonferroni&quot;)</code></pre>
+<pre><code class="language-r">close_final &lt;- close_final %&gt;% 
+    mutate(
+        non_white = non_white * 10,
+        Poverty_rate = Poverty_rate * 10,
+        Insured = Insured * 10
+    )</code></pre>
+<pre><code class="language-r">socio_model &lt;- glm(treated ~ non_white + Insured + Poverty_rate + `Median Age`, data = close_final, family = binomial)
+summary(socio_model)</code></pre>
+<pre><code class="language-r">anova(null_model, socio_model, test=&#x27;Chisq&#x27;)</code></pre>
+<pre><code class="language-r">est &lt;- coef(socio_model)
+se &lt;- summary(socio_model)$coefficients[, &quot;Std. Error&quot;]
+OR &lt;- exp(est)
+ci_low &lt;- exp(est - 1.96 * se)
+ci_high &lt;- exp(est + 1.96 * se)
+data.frame(term = names(est), estimate = est, OR = OR, CI_lower = ci_low, CI_upper = ci_high, p = summary(socio_model)$coefficients[,4])</code></pre>
+<pre><code class="language-r">library(fixest)
+library(HonestDiD)
+
+ANCHOR      &lt;- as.Date(&quot;2021-12-01&quot;)   # first full post-opening month
+OPEN_DATE   &lt;- as.Date(&quot;2021-11-30&quot;)
+PHASEIN_END &lt;- as.Date(&quot;2022-05-31&quot;)
+COVID_START &lt;- as.Date(&quot;2020-03-01&quot;)
+COVID_END   &lt;- as.Date(&quot;2021-07-01&quot;)
+EMS_START   &lt;- as.Date(&quot;2018-07-01&quot;)
+WIN_END     &lt;- as.Date(&quot;2024-07-01&quot;)</code></pre>
+<h2>Verify treatment assignment before anything else</h2>
+<pre><code class="language-r">site_zips &lt;- sapply(st_within(sites_shp, nyc_shp_EMS),
+                    \(i) if (length(i) == 1) nyc_shp_EMS$ZCTA5CE20[i] else NA_real_)
+print(site_zips)
+stopifnot(nrow(sites_shp) == 2, setequal(site_zips, c(10035, 10033)))
+
+treated_zip_codes    &lt;- site_zips
+contig_list          &lt;- unique(unlist(nb[which(nyc_shp_EMS$ZCTA5CE20 %in% site_zips)]))
+contiguous_zip_codes &lt;- nyc_shp_EMS$ZCTA5CE20[contig_list]
+nyc_shp_EMS$treated  &lt;- nyc_shp_EMS$ZCTA5CE20 %in% c(treated_zip_codes, contiguous_zip_codes)
+
+cat(&quot;Treated ZIPs:&quot;, sum(nyc_shp_EMS$treated), &quot;of&quot;, nrow(nyc_shp_EMS), &quot;\n&quot;)</code></pre>
+<h2>Geography lookup: distance bands and per-site assignment</h2>
+<pre><code class="language-r">cent    &lt;- st_centroid(nyc_shp_EMS)
+dist_m  &lt;- apply(st_distance(cent, sites_shp), 1, min) |&gt; as.numeric()
+
+near_of &lt;- function(z) {
+  i &lt;- which(nyc_shp_EMS$ZCTA5CE20 == z)
+  unique(c(z, nyc_shp_EMS$ZCTA5CE20[nb[[i]]]))
+}
+near_eh &lt;- near_of(10035); near_wh &lt;- near_of(10033)
+
+geo &lt;- nyc_shp_EMS %&gt;% st_drop_geometry() %&gt;%
+  transmute(
+    ZIPCODE    = ZCTA5CE20,
+    treated    = as.integer(treated),
+    Population = as.numeric(as.character(Population)),
+    dist_mi    = dist_m / 1609.34,
+    band       = relevel(cut(dist_mi, c(-Inf,.5,1,2,3,Inf),
+                             labels = c(&quot;0-0.5mi&quot;,&quot;0.5-1mi&quot;,&quot;1-2mi&quot;,&quot;2-3mi&quot;,&quot;3mi+&quot;)),
+                         ref = &quot;3mi+&quot;),
+    site       = case_when(ZIPCODE %in% near_eh ~ &quot;EastHarlem&quot;,
+                           ZIPCODE %in% near_wh ~ &quot;WashHeights&quot;,
+                           TRUE ~ &quot;Control&quot;)
+  ) %&gt;%
+  filter(!is.na(Population), Population &gt; 0)
+
+# 1,000 m buffer definition, kept as an alternative specification
+buf_zip &lt;- nyc_shp_EMS$ZCTA5CE20[lengths(st_intersects(nyc_shp_EMS, sites_buffer_shp)) &gt; 0]</code></pre>
+<h2>Panel builder</h2>
+<pre><code class="language-r">build_panel &lt;- function(dat, zip_col, date_col, start, end, label) {
+  counts &lt;- dat %&gt;%
+    transmute(ZIPCODE = suppressWarnings(as.numeric(.data[[zip_col]])),
+              month   = floor_date(.data[[date_col]], &quot;month&quot;)) %&gt;%
+    filter(ZIPCODE %in% geo$ZIPCODE, month &gt;= start, month &lt;= end) %&gt;%
+    count(ZIPCODE, month, name = &quot;y&quot;)
+
+  expand_grid(ZIPCODE = geo$ZIPCODE,
+              month   = seq(start, end, by = &quot;month&quot;)) %&gt;%
+    left_join(counts, by = c(&quot;ZIPCODE&quot;,&quot;month&quot;)) %&gt;%
+    mutate(y = replace_na(y, 0)) %&gt;%
+    left_join(geo, by = &quot;ZIPCODE&quot;) %&gt;%
+    mutate(month_fe  = factor(month),
+           rel_month = interval(ANCHOR, month) %/% months(1),
+           post      = as.integer(month &gt;  PHASEIN_END),
+           phasein   = as.integer(month &gt;= ANCHOR &amp; month &lt;= PHASEIN_END),
+           outcome   = label)
+}
+
+drop_covid &lt;- function(p) p %&gt;% filter(!(month &gt;= COVID_START &amp; month &lt; COVID_END))</code></pre>
+<h2>EMS panel</h2>
+<pre><code class="language-r">ems_full &lt;- build_panel(EMS, &quot;ZIPCODE&quot;, &quot;INCIDENT_DATETIME&quot;, EMS_START, WIN_END, &quot;EMS&quot;)
+ems_es   &lt;- drop_covid(ems_full)
+
+cat(&quot;Rows:&quot;, nrow(ems_es), &quot; ZIPs:&quot;, n_distinct(ems_es$ZIPCODE),
+    &quot; Months:&quot;, n_distinct(ems_es$month), &quot;\n&quot;)
+print(table(treated = ems_es$treated, post = ems_es$post))</code></pre>
+<h2>Syringe panel — check the data start first</h2>
+<pre><code class="language-r">syr_rng &lt;- syringe %&gt;%
+  transmute(ZIPCODE = suppressWarnings(as.numeric(Incident.Zip)),
+            month   = floor_date(Created.Date, &quot;month&quot;)) %&gt;%
+  filter(ZIPCODE %in% geo$ZIPCODE)
+
+range(syr_rng$month)
+as.data.frame(dplyr::count(syr_rng, month))[1:8, ]   # look for a ramp-up</code></pre>
+<pre><code class="language-r">SYR_START &lt;- as.Date(&quot;2019-11-01&quot;)     # revise if the counts above show a ramp
+
+syr_full &lt;- build_panel(syringe, &quot;Incident.Zip&quot;, &quot;Created.Date&quot;, SYR_START, WIN_END, &quot;Syringe&quot;)
+syr_es   &lt;- drop_covid(syr_full)
+
+cat(&quot;Rows:&quot;, nrow(syr_es), &quot; Months:&quot;, n_distinct(syr_es$month),
+    &quot; Zero cells:&quot;, round(mean(syr_es$y == 0), 3), &quot;\n&quot;)</code></pre>
+<h2>Aggregate difference-in-differences</h2>
+<pre><code class="language-r">fit_did &lt;- function(p)
+  fepois(y ~ treated:post + treated:phasein | ZIPCODE + month_fe,
+         data = p, offset = ~log(Population), cluster = ~ZIPCODE)
+
+did_ems &lt;- fit_did(ems_es)
+did_syr &lt;- fit_did(syr_es)
+etable(did_ems, did_syr)
+
+pct_row &lt;- function(m, lab) {
+  b &lt;- coef(m)[[&quot;treated:post&quot;]]; s &lt;- se(m)[[&quot;treated:post&quot;]]
+  tibble(outcome = lab, coef = b, se = s, p = pvalue(m)[[&quot;treated:post&quot;]],
+         rate_ratio = exp(b), pct = 100*(exp(b)-1),
+         lo = 100*(exp(b-1.96*s)-1), hi = 100*(exp(b+1.96*s)-1))
+}
+main_tab &lt;- bind_rows(pct_row(did_ems, &quot;EMS calls&quot;),
+                      pct_row(did_syr, &quot;311 syringe complaints&quot;))
+print(main_tab)</code></pre>
+<h2>Dispersion check</h2>
+<pre><code class="language-r">disp &lt;- function(m) sum(residuals(m, type = &quot;pearson&quot;)^2) / df.residual(m)
+c(EMS = disp(did_ems), Syringe = disp(did_syr))</code></pre>
+<h2>Event studies and pre-trend tests</h2>
+<pre><code class="language-r">fit_es &lt;- function(p)
+  fepois(y ~ i(rel_month, treated, ref = -1) | ZIPCODE + month_fe,
+         data = p, offset = ~log(Population), cluster = ~ZIPCODE)
+
+es_ems &lt;- fit_es(ems_es); es_syr &lt;- fit_es(syr_es)
+iplot(es_ems, main = &quot;EMS calls&quot;); iplot(es_syr, main = &quot;311 syringe complaints&quot;)
+
+wald(es_ems, keep = &quot;rel_month::-&quot;)
+wald(es_syr, keep = &quot;rel_month::-&quot;)</code></pre>
+<h3>Three-window decomposition on the full panel</h3>
+<pre><code class="language-r">es_ems_full &lt;- fit_es(ems_full)
+iplot(es_ems_full, main = &quot;EMS, including pandemic months&quot;)
+
+pre_window &lt;- function(m, lo, hi) {
+  tm  &lt;- grep(&quot;^rel_month::&quot;, names(coef(m)), value = TRUE)
+  r   &lt;- as.integer(sub(&quot;.*rel_month::(-?[0-9]+):.*&quot;, &quot;\\1&quot;, tm))
+  sel &lt;- sort(r[r &gt;= lo &amp; r &lt;= hi])
+  if (!length(sel)) return(NULL)
+  wald(m, keep = paste0(&quot;rel_month::(&quot;, paste(sel, collapse = &quot;|&quot;), &quot;):&quot;))
+}
+pre_window(es_ems_full, -41, -22)   # Jul 2018 - Feb 2020
+pre_window(es_ems_full, -21,  -6)   # Mar 2020 - Jun 2021 (pandemic)
+pre_window(es_ems_full,  -5,  -2)   # Jul - Oct 2021</code></pre>
+<h3>Syringe pre-trend windows</h3>
+<pre><code class="language-r">es_syr_full &lt;- fit_es(syr_full)
+pre_window(es_syr_full, -25, -22)   # Nov 2019 - Feb 2020
+pre_window(es_syr_full,  -5,  -2)   # Jul - Oct 2021</code></pre>
+<h3>Small-sample joint test (CR2)</h3>
+<pre><code class="language-r">library(clubSandwich)
+
+boot_window &lt;- function(p, lo, hi) {
+  lin &lt;- feols(I(y/Population*1e4) ~ i(rel_month, treated, ref = -1) | ZIPCODE + month_fe,
+               data = p)
+  tm  &lt;- grep(&quot;^rel_month::&quot;, names(coef(lin)), value = TRUE)
+  r   &lt;- as.integer(sub(&quot;.*rel_month::(-?[0-9]+):.*&quot;, &quot;\\1&quot;, tm))
+  sel &lt;- tm[r &gt;= lo &amp; r &lt;= hi]
+  if (!length(sel)) return(NULL)
+  Wald_test(lin, constraints = constrain_zero(sel), vcov = &quot;CR2&quot;,
+            cluster = p$ZIPCODE, test = &quot;HTZ&quot;)
+}
+
+try_window &lt;- function(p, lo, hi, lab) {
+  out &lt;- tryCatch(boot_window(p, lo, hi), error = function(e) NULL)
+  cat(&quot;\n&quot;, lab, &quot;: &quot;)
+  if (is.null(out)) cat(&quot;not computable (rank-deficient contrast)\n&quot;) else print(out)
+}
+
+try_window(ems_full, -41, -22, &quot;EMS pre-COVID&quot;)
+try_window(ems_full, -21,  -6, &quot;EMS pandemic&quot;)
+try_window(ems_full,  -5,  -2, &quot;EMS pre-opening&quot;)
+try_window(syr_full, -25, -22, &quot;Syringe early&quot;)
+try_window(syr_full,  -5,  -2, &quot;Syringe pre-opening&quot;)</code></pre>
+<h2>Placebo intervention dates</h2>
+<pre><code class="language-r">placebo &lt;- map_dfr(as.Date(c(&quot;2018-12-01&quot;,&quot;2019-03-01&quot;,&quot;2019-06-01&quot;,&quot;2019-09-01&quot;)),
+  function(d) {
+    dd &lt;- ems_es %&gt;% filter(month &lt; OPEN_DATE) %&gt;%
+      mutate(tp = treated * as.integer(month &gt; d))
+    if (n_distinct(dd$tp) &lt; 2) return(NULL)
+    m &lt;- fepois(y ~ tp | ZIPCODE + month_fe, data = dd,
+                offset = ~log(Population), cluster = ~ZIPCODE)
+    tibble(date = d, coef = coef(m)[[&quot;tp&quot;]], se = se(m)[[&quot;tp&quot;]], p = pvalue(m)[[&quot;tp&quot;]])
+  })
+print(placebo)</code></pre>
+<h2>Site-specific estimates</h2>
+<pre><code class="language-r">site_est &lt;- map_dfr(c(&quot;EastHarlem&quot;,&quot;WashHeights&quot;), function(s) {
+  map_dfr(list(EMS = ems_es, Syringe = syr_es) %&gt;% imap(\(p,n) list(p=p,n=n)) %&gt;% unname(),
+    function(x) {
+      dd &lt;- x$p %&gt;% filter(site %in% c(s, &quot;Control&quot;)) %&gt;%
+        mutate(tr = as.integer(site == s), tp = tr * post)
+      m &lt;- fepois(y ~ tp | ZIPCODE + month_fe, data = dd,
+                  offset = ~log(Population), cluster = ~ZIPCODE)
+      tibble(site = s, outcome = x$n, coef = coef(m)[[&quot;tp&quot;]],
+             pct = 100*(exp(coef(m)[[&quot;tp&quot;]])-1), p = pvalue(m)[[&quot;tp&quot;]])
+    })
+})
+print(site_est)</code></pre>
+<h2>Alternative comparison groups</h2>
+<pre><code class="language-r">pre_prof &lt;- ems_es %&gt;% filter(month &lt; OPEN_DATE) %&gt;%
+  group_by(ZIPCODE) %&gt;%
+  summarise(mu = 1e4*sum(y)/sum(Population),
+            sl = coef(lm(y ~ as.numeric(month)))[[2]], .groups = &quot;drop&quot;)
+tr_mu &lt;- mean(pre_prof$mu[pre_prof$ZIPCODE %in% geo$ZIPCODE[geo$treated==1]])
+tr_sl &lt;- mean(pre_prof$sl[pre_prof$ZIPCODE %in% geo$ZIPCODE[geo$treated==1]])
+matched &lt;- pre_prof %&gt;% filter(!ZIPCODE %in% geo$ZIPCODE[geo$treated==1]) %&gt;%
+  mutate(d = sqrt(((mu-tr_mu)/sd(mu))^2 + ((sl-tr_sl)/sd(sl))^2)) %&gt;%
+  slice_min(d, n = 20) %&gt;% pull(ZIPCODE)
+
+ctrl_sets &lt;- list(
+  &quot;All Manhattan&quot;      = geo$ZIPCODE,
+  &quot;Donut (&gt;2mi)&quot;       = geo$ZIPCODE[geo$treated == 1 | geo$dist_mi &gt; 2],
+  &quot;Matched pre-period&quot; = c(geo$ZIPCODE[geo$treated==1], matched),
+  &quot;1,000m buffer&quot;      = geo$ZIPCODE)
+
+alt &lt;- imap_dfr(ctrl_sets, function(zs, nm) {
+  map_dfr(list(EMS = ems_es, Syringe = syr_es), function(p) {
+    dd &lt;- p %&gt;% filter(ZIPCODE %in% zs)
+    if (nm == &quot;1,000m buffer&quot;)
+      dd &lt;- dd %&gt;% mutate(treated = as.integer(ZIPCODE %in% buf_zip),
+                          post = post)
+    m &lt;- fepois(y ~ treated:post | ZIPCODE + month_fe, data = dd,
+                offset = ~log(Population), cluster = ~ZIPCODE)
+    tibble(control_set = nm, outcome = unique(p$outcome), n_zip = n_distinct(dd$ZIPCODE),
+           pct = 100*(exp(coef(m)[[&quot;treated:post&quot;]])-1), p = pvalue(m)[[&quot;treated:post&quot;]])
+  }, .id = &quot;which&quot;)
+})
+print(alt)</code></pre>
+<h2>Distance bands — the spillover test</h2>
+<pre><code class="language-r">band_fit &lt;- function(p)
+  fepois(y ~ i(band, post, ref = &quot;3mi+&quot;) | ZIPCODE + month_fe,
+         data = p, offset = ~log(Population), cluster = ~ZIPCODE)
+
+band_ems &lt;- band_fit(ems_es); band_syr &lt;- band_fit(syr_es)
+etable(band_ems, band_syr)
+iplot(band_ems, main = &quot;EMS by distance band&quot;); iplot(band_syr, main = &quot;Syringe by distance band&quot;)</code></pre>
+<h2>Randomization inference (primary p-value)</h2>
+<pre><code class="language-r">ri_p &lt;- function(p, B = 1000) {
+  obs  &lt;- coef(fepois(y ~ treated:post | ZIPCODE + month_fe, data = p,
+                      offset = ~log(Population)))[[&quot;treated:post&quot;]]
+  cand &lt;- geo$ZIPCODE[geo$dist_mi &gt; 2]
+  draws &lt;- map_dbl(seq_len(B), function(i) {
+    fh &lt;- sample(cand, 2)
+    fn &lt;- unique(unlist(lapply(fh, near_of)))
+    dd &lt;- p %&gt;% mutate(tp = as.integer(ZIPCODE %in% fn) * post)
+    tryCatch(coef(fepois(y ~ tp | ZIPCODE + month_fe, data = dd,
+                         offset = ~log(Population)))[[&quot;tp&quot;]],
+             error = function(e) NA_real_)
+  })
+  tibble(observed = obs, null_sd = sd(draws, na.rm = TRUE),
+         ri_p = mean(abs(draws) &gt;= abs(obs), na.rm = TRUE))
+}
+set.seed(20211130)
+bind_rows(EMS = ri_p(ems_es), Syringe = ri_p(syr_es), .id = &quot;outcome&quot;)</code></pre>
+<h2>Sensitivity to trend violations (HonestDiD)</h2>
+<pre><code class="language-r">honest &lt;- function(m, n_post = 12) {
+  ct &lt;- as.data.frame(coeftable(m)); ct$term &lt;- rownames(ct)
+  ct &lt;- ct[grepl(&quot;^rel_month::&quot;, ct$term), ]
+  ct$rel &lt;- as.integer(sub(&quot;.*rel_month::(-?[0-9]+):.*&quot;, &quot;\\1&quot;, ct$term))
+  keep &lt;- ct[ct$rel %in% c(-5:-2, 0:(n_post-1)), ]
+  keep &lt;- keep[order(keep$rel), ]
+  idx  &lt;- match(keep$term, names(coef(m)))
+  b &lt;- keep$Estimate; S &lt;- vcov(m)[idx, idx]
+  l &lt;- c(rep(0, 6), rep(1/(n_post-6), n_post-6))
+  stopifnot(length(b) == 4 + n_post, length(l) == n_post)
+  list(orig = constructOriginalCS(b, S, 4, n_post, l_vec = l),
+       rm   = createSensitivityResults_relativeMagnitudes(
+                b, S, 4, n_post, l_vec = l, Mbarvec = seq(0.25, 2, by = 0.25),
+                grid.lb = -5, grid.ub = 5, gridPoints = 1000))
+}
+h_ems &lt;- honest(es_ems); h_ems$rm
+createSensitivityPlot_relativeMagnitudes(h_ems$rm, h_ems$orig)</code></pre>
+<h2>Regenerate Table 1 from the model objects</h2>
+<pre><code class="language-r">fmt_p &lt;- function(p) ifelse(p &lt; .001, &quot;&lt; .001&quot;, sprintf(&quot;= %.3f&quot;, p))
+table1 &lt;- main_tab %&gt;%
+  transmute(Outcome = outcome,
+            `Coefficient (log rate ratio)` = sprintf(&quot;%.4f&quot;, coef),
+            SE = sprintf(&quot;%.4f&quot;, se),
+            `Rate ratio` = sprintf(&quot;%.3f&quot;, rate_ratio),
+            `% change [95% CI]` = sprintf(&quot;%.1f [%.1f, %.1f]&quot;, pct, lo, hi),
+            `p (cluster-robust)` = fmt_p(p))
+kable(table1)</code></pre>
+<h2>Additional analyses added during peer review</h2>
+<pre><code class="language-r">library(fixest); library(spdep); library(sf); library(tidyverse)
+library(car); library(ResourceSelection)
+set.seed(20211130)</code></pre>
+<h3>1. Negative binomial refit</h3>
+<pre><code class="language-r">disp &lt;- function(m) sum(residuals(m, type = &quot;pearson&quot;)^2) / df.residual(m)
+cat(&quot;Dispersion — EMS:&quot;, round(disp(did_ems), 3),
+    &quot; Syringe:&quot;, round(disp(did_syr), 3), &quot;\n&quot;)
+
+did_ems_nb &lt;- fenegbin(y ~ treated:post + treated:phasein | ZIPCODE + month_fe,
+                       data = ems_es, offset = ~log(Population), cluster = ~ZIPCODE)
+did_syr_nb &lt;- fenegbin(y ~ treated:post + treated:phasein | ZIPCODE + month_fe,
+                       data = syr_es, offset = ~log(Population), cluster = ~ZIPCODE)
+
+etable(did_ems, did_ems_nb, did_syr, did_syr_nb,
+       headers = c(&quot;EMS Poisson&quot;, &quot;EMS NegBin&quot;, &quot;Syr Poisson&quot;, &quot;Syr NegBin&quot;))</code></pre>
+<pre><code class="language-r">nb_row &lt;- function(m, lab, spec) {
+  b &lt;- coef(m)[[&quot;treated:post&quot;]]; s &lt;- se(m)[[&quot;treated:post&quot;]]
+  tibble(outcome = lab, spec = spec, coef = b, se = s,
+         p = pvalue(m)[[&quot;treated:post&quot;]],
+         pct = 100*(exp(b)-1),
+         lo  = 100*(exp(b - 1.96*s)-1),
+         hi  = 100*(exp(b + 1.96*s)-1))
+}
+bind_rows(nb_row(did_ems,    &quot;EMS calls&quot;,    &quot;Poisson&quot;),
+          nb_row(did_ems_nb, &quot;EMS calls&quot;,    &quot;NegBin&quot;),
+          nb_row(did_syr,    &quot;311 syringes&quot;, &quot;Poisson&quot;),
+          nb_row(did_syr_nb, &quot;311 syringes&quot;, &quot;NegBin&quot;)) %&gt;%
+  mutate(across(where(is.numeric), \(x) round(x, 4))) %&gt;%
+  knitr::kable(caption = &quot;Main DiD estimates under both specifications&quot;)</code></pre>
+<pre><code class="language-r">band_ems_nb &lt;- fenegbin(y ~ i(band, post, ref = &quot;3mi+&quot;) | ZIPCODE + month_fe,
+                        data = ems_es, offset = ~log(Population), cluster = ~ZIPCODE)
+band_syr_nb &lt;- fenegbin(y ~ i(band, post, ref = &quot;3mi+&quot;) | ZIPCODE + month_fe,
+                        data = syr_es, offset = ~log(Population), cluster = ~ZIPCODE)
+
+tidy_bands &lt;- function(m, lab) {
+  ct &lt;- as.data.frame(coeftable(m))
+  tibble(outcome = lab,
+         term = rownames(ct),
+         est  = ct[[1]],
+         se   = ct[[2]],
+         p    = ct[[ncol(ct)]]) %&gt;%
+    filter(str_detect(term, &quot;^band::&quot;)) %&gt;%
+    transmute(outcome,
+              band = str_extract(term, &quot;(?&lt;=band::)[^:]+&quot;),
+              pct  = round(100*(exp(est)-1), 1),
+              lo   = round(100*(exp(est - 1.96*se)-1), 1),
+              hi   = round(100*(exp(est + 1.96*se)-1), 1),
+              p    = round(p, 4))
+}
+
+bind_rows(tidy_bands(band_ems_nb, &quot;EMS&quot;),
+          tidy_bands(band_syr_nb, &quot;Syringe&quot;)) %&gt;%
+  knitr::kable(caption = &quot;Distance bands, negative binomial&quot;)</code></pre>
+<pre><code class="language-r">table(geo$band)
+geo$ZIPCODE[geo$band == &quot;0-0.5mi&quot;]</code></pre>
+<pre><code class="language-r">ri_band &lt;- function(p, B = 1000) {
+  obs &lt;- coef(fepois(y ~ i(band, post, ref = &quot;3mi+&quot;) | ZIPCODE + month_fe,
+                     data = p, offset = ~log(Population)))
+  obs &lt;- obs[grep(&quot;0-0.5mi&quot;, names(obs))][1]
+  cand  &lt;- geo$ZIPCODE[geo$dist_mi &gt; 2]
+  draws &lt;- map_dbl(seq_len(B), function(i) {
+    fake &lt;- sample(cand, 2)
+    dd &lt;- p %&gt;% mutate(fb = factor(ifelse(ZIPCODE %in% fake, &quot;inner&quot;, &quot;outer&quot;),
+                                   levels = c(&quot;outer&quot;, &quot;inner&quot;)))
+    tryCatch(coef(fepois(y ~ i(fb, post, ref = &quot;outer&quot;) | ZIPCODE + month_fe,
+                         data = dd, offset = ~log(Population)))[1],
+             error = function(e) NA_real_)
+  })
+  tibble(observed = obs, null_sd = sd(draws, na.rm = TRUE),
+         ri_p = mean(abs(draws) &gt;= abs(obs), na.rm = TRUE))
+}
+bind_rows(EMS = ri_band(ems_es), Syringe = ri_band(syr_es), .id = &quot;outcome&quot;) %&gt;%
+  mutate(across(where(is.numeric), \(x) round(x, 4))) %&gt;%
+  knitr::kable(caption = &quot;Randomization inference, 0–0.5 mile band&quot;)</code></pre>
+<h3>2. Local Moran&#x27;s I, and global Moran&#x27;s I on rates</h3>
+<pre><code class="language-r"># One object, one geometry, one row order, one weights matrix
+dat &lt;- nyc_shp_EMS %&gt;%
+  mutate(Population = as.numeric(as.character(Population))) %&gt;%
+  filter(!is.na(Population), Population &gt; 0) %&gt;%
+  select(-any_of(c(&quot;pre_syringe_counts_per_zipcode&quot;,
+                   &quot;post_syringe_counts_per_zipcode&quot;))) %&gt;%
+  left_join(nyc_shp_syringe %&gt;% st_drop_geometry() %&gt;%
+              select(ZCTA5CE20,
+                     pre_syringe_counts_per_zipcode,
+                     post_syringe_counts_per_zipcode),
+            by = &quot;ZCTA5CE20&quot;) %&gt;%
+  mutate(across(c(pre_syringe_counts_per_zipcode,
+                  post_syringe_counts_per_zipcode), \(x) replace_na(x, 0)),
+         ems_pre  = pre_EMS_counts_per_zipcode      / Population * 1e4,
+         ems_post = post_EMS_counts_per_zipcode     / Population * 1e4,
+         syr_pre  = pre_syringe_counts_per_zipcode  / Population * 1e4,
+         syr_post = post_syringe_counts_per_zipcode / Population * 1e4)
+
+cat(&quot;ZIP codes retained:&quot;, nrow(dat), &quot;\n&quot;)
+cat(&quot;Dropped from syringe object:&quot;,
+    paste(setdiff(nyc_shp_syringe$ZCTA5CE20, dat$ZCTA5CE20), collapse = &quot;, &quot;), &quot;\n&quot;)
+
+lw_common &lt;- nb2listw(poly2nb(dat), style = &quot;W&quot;, zero.policy = TRUE)
+
+set.seed(20211130)
+mc &lt;- function(x) moran.mc(x, lw_common, nsim = 999, zero.policy = TRUE)
+res &lt;- list(`EMS, pre` = mc(dat$ems_pre),  `EMS, post` = mc(dat$ems_post),
+            `Syringe, pre` = mc(dat$syr_pre), `Syringe, post` = mc(dat$syr_post))
+
+tibble(series   = names(res),
+       morans_i = round(sapply(res, \(x) as.numeric(x$statistic)), 4),
+       p        = sapply(res, \(x) x$p.value)) %&gt;%
+  knitr::kable(caption = &quot;Global Moran&#x27;s I, rates per 10,000, common ZIP set&quot;)</code></pre>
+<pre><code class="language-r">lisa &lt;- localmoran(dat$ems_post, lw_common, zero.policy = TRUE)
+
+dat$lisa_i   &lt;- lisa[, &quot;Ii&quot;]
+dat$lisa_p   &lt;- lisa[, ncol(lisa)]
+dat$lisa_fdr &lt;- p.adjust(dat$lisa_p, method = &quot;BH&quot;)
+
+z  &lt;- scale(dat$ems_post)[, 1]
+lz &lt;- lag.listw(lw_common, z, zero.policy = TRUE)
+dat$lisa_type &lt;- case_when(
+  dat$lisa_fdr &gt;= .05 ~ &quot;Not significant&quot;,
+  z &gt; 0 &amp; lz &gt; 0 ~ &quot;High-High&quot;, z &lt; 0 &amp; lz &lt; 0 ~ &quot;Low-Low&quot;,
+  z &gt; 0 &amp; lz &lt; 0 ~ &quot;High-Low&quot;,  TRUE ~ &quot;Low-High&quot;)
+
+cat(&quot;Significant before correction:&quot;, sum(dat$lisa_p   &lt; .05), &quot;of&quot;, nrow(dat), &quot;\n&quot;)
+cat(&quot;Significant after FDR:        &quot;, sum(dat$lisa_fdr &lt; .05), &quot;of&quot;, nrow(dat), &quot;\n&quot;)
+
+dat %&gt;% st_drop_geometry() %&gt;%
+  transmute(ZIPCODE = ZCTA5CE20, treated,
+            rate = round(ems_post, 2), Ii = round(lisa_i, 3),
+            p = round(lisa_p, 4), p_fdr = round(lisa_fdr, 4), lisa_type) %&gt;%
+  arrange(p) %&gt;% head(15) %&gt;%
+  knitr::kable(caption = &quot;Local Moran&#x27;s I, post-intervention EMS call rate&quot;)</code></pre>
+<pre><code class="language-r">dat %&gt;% st_drop_geometry() %&gt;%
+  filter(ZCTA5CE20 %in% c(10033, 10035)) %&gt;%
+  transmute(ZIPCODE = ZCTA5CE20, Ii = round(lisa_i, 3),
+            p = round(lisa_p, 4), p_fdr = round(lisa_fdr, 4), lisa_type)</code></pre>
+<pre><code class="language-r">p_lisa &lt;- ggplot(dat) +
+  geom_sf(aes(fill = lisa_type), color = &quot;grey40&quot;, linewidth = .2) +
+  scale_fill_manual(values = c(&quot;High-High&quot; = &quot;#b2182b&quot;, &quot;Low-Low&quot; = &quot;#2166ac&quot;,
+                               &quot;High-Low&quot; = &quot;#ef8a62&quot;, &quot;Low-High&quot; = &quot;#67a9cf&quot;,
+                               &quot;Not significant&quot; = &quot;grey90&quot;),
+                    name = NULL, drop = TRUE) +
+  geom_sf(data = sites_shp, shape = 21, fill = &quot;white&quot;, size = 3) +
+  labs(title = &quot;Local Moran&#x27;s I, EMS drug-related call rate, post-intervention&quot;,
+       caption = &quot;Open circles mark supervised consumption site locations.&quot;) +
+  theme_void()
+
+p_lisa</code></pre>
+<pre><code class="language-r">lisa_s &lt;- localmoran(dat$syr_post, lw_common, zero.policy = TRUE)
+
+dat$lisa_i_syr   &lt;- lisa_s[, &quot;Ii&quot;]
+dat$lisa_p_syr   &lt;- lisa_s[, ncol(lisa_s)]
+dat$lisa_fdr_syr &lt;- p.adjust(dat$lisa_p_syr, method = &quot;BH&quot;)
+
+zs  &lt;- scale(dat$syr_post)[, 1]
+lzs &lt;- lag.listw(lw_common, zs, zero.policy = TRUE)
+dat$lisa_type_syr &lt;- case_when(
+  dat$lisa_fdr_syr &gt;= .05 ~ &quot;Not significant&quot;,
+  zs &gt; 0 &amp; lzs &gt; 0 ~ &quot;High-High&quot;, zs &lt; 0 &amp; lzs &lt; 0 ~ &quot;Low-Low&quot;,
+  zs &gt; 0 &amp; lzs &lt; 0 ~ &quot;High-Low&quot;,  TRUE ~ &quot;Low-High&quot;)
+
+cat(&quot;Syringe, significant before correction:&quot;, sum(dat$lisa_p_syr   &lt; .05), &quot;of&quot;, nrow(dat), &quot;\n&quot;)
+cat(&quot;Syringe, significant after FDR:        &quot;, sum(dat$lisa_fdr_syr &lt; .05), &quot;of&quot;, nrow(dat), &quot;\n&quot;)
+
+dat %&gt;% st_drop_geometry() %&gt;%
+  transmute(ZIPCODE = ZCTA5CE20, treated,
+            rate = round(syr_post, 2), Ii = round(lisa_i_syr, 3),
+            p = round(lisa_p_syr, 4), p_fdr = round(lisa_fdr_syr, 4),
+            lisa_type = lisa_type_syr) %&gt;%
+  arrange(p) %&gt;% head(15) %&gt;%
+  knitr::kable(caption = &quot;Local Moran&#x27;s I, post-intervention 311 syringe complaint rate&quot;)</code></pre>
+<pre><code class="language-r">dat %&gt;% st_drop_geometry() %&gt;%
+  filter(ZCTA5CE20 %in% c(10033, 10035)) %&gt;%
+  transmute(ZIPCODE = ZCTA5CE20, rate = round(syr_post, 2),
+            Ii = round(lisa_i_syr, 3), p = round(lisa_p_syr, 4),
+            p_fdr = round(lisa_fdr_syr, 4), lisa_type = lisa_type_syr)</code></pre>
+<pre><code class="language-r">p_lisa_syr &lt;- ggplot(dat) +
+  geom_sf(aes(fill = lisa_type_syr), color = &quot;grey40&quot;, linewidth = .2) +
+  scale_fill_manual(values = c(&quot;High-High&quot; = &quot;#b2182b&quot;, &quot;Low-Low&quot; = &quot;#2166ac&quot;,
+                               &quot;High-Low&quot; = &quot;#ef8a62&quot;, &quot;Low-High&quot; = &quot;#67a9cf&quot;,
+                               &quot;Not significant&quot; = &quot;grey90&quot;),
+                    name = NULL, drop = TRUE) +
+  geom_sf(data = sites_shp, shape = 21, fill = &quot;white&quot;, size = 3) +
+  labs(title = &quot;Local Moran&#x27;s I, 311 syringe complaint rate, post-intervention&quot;,
+       caption = &quot;Open circles mark supervised consumption site locations.&quot;) +
+  theme_void()
+
+p_lisa_syr</code></pre>
+<h3>3. Diagnostics for the socioeconomic logistic model</h3>
+<pre><code class="language-r">close_final &lt;- close_final %&gt;% rename(Median_age = `Median Age`)
+socio_vars &lt;- c(&quot;non_white&quot;, &quot;Poverty_rate&quot;, &quot;Insured&quot;, &quot;Median_age&quot;)
+summary(close_final[, socio_vars])</code></pre>
+<pre><code class="language-r">socio_dat &lt;- close_final %&gt;% drop_na(all_of(c(socio_vars, &quot;treated&quot;)))
+
+socio_model &lt;- glm(treated ~ non_white + Poverty_rate + Insured + Median_age,
+                   family = binomial, data = socio_dat)
+summary(socio_model)</code></pre>
+<pre><code class="language-r">tibble(term = names(car::vif(socio_model)),
+       VIF  = round(as.numeric(car::vif(socio_model)), 2)) %&gt;%
+  knitr::kable(caption = &quot;Variance inflation factors (&gt;5 problematic, &gt;10 severe)&quot;)</code></pre>
+<pre><code class="language-r">null_fit &lt;- glm(treated ~ 1, family = binomial, data = socio_dat)
+mcfadden &lt;- as.numeric(1 - logLik(socio_model) / logLik(null_fit))
+hl &lt;- hoslem.test(socio_model$y, fitted(socio_model), g = 8)
+lr &lt;- anova(null_fit, socio_model, test = &quot;Chisq&quot;)
+
+tibble(statistic = c(&quot;McFadden pseudo-R2&quot;, &quot;Hosmer-Lemeshow X2&quot;,
+                     &quot;Hosmer-Lemeshow p&quot;, &quot;Likelihood-ratio p&quot;),
+       value = round(c(mcfadden, hl$statistic, hl$p.value, lr$`Pr(&gt;Chi)`[2]), 4)) %&gt;%
+  knitr::kable(caption = &quot;Goodness of fit&quot;)</code></pre>
+<pre><code class="language-r">map_dfr(socio_vars, function(v) {
+  m  &lt;- glm(as.formula(paste(&quot;treated ~&quot;, v)), family = binomial, data = socio_dat)
+  ct &lt;- summary(m)$coefficients[2, ]
+  tibble(term = v, coef = ct[1], se = ct[2], p_raw = ct[4])
+}) %&gt;%
+  mutate(p_bonf  = p.adjust(p_raw, method = &quot;bonferroni&quot;),
+         mult    = ifelse(term == &quot;Median_age&quot;, 1, 0.10),
+         OR      = exp(mult * coef),
+         OR_lo   = exp(mult * (coef - 1.96*se)),
+         OR_hi   = exp(mult * (coef + 1.96*se)),
+         across(where(is.numeric), \(x) round(x, 4))) %&gt;%
+  select(-mult) %&gt;%
+  knitr::kable(caption = &quot;Bivariate models with Bonferroni correction&quot;)</code></pre>
+<h3>4. Co-intervention sensitivity test</h3>
+<pre><code class="language-r">sites_scs &lt;- read_csv(&quot;data/scs_locations.csv&quot;)
+sx &lt;- sites_scs %&gt;% filter(`Site Type` != &quot;SCS&quot;) %&gt;%
+  st_as_sf(coords = c(&quot;Longitude&quot;, &quot;Latitude&quot;), crs = 4326) %&gt;%
+  st_transform(st_crs(nyc_shp_EMS))
+
+sx_zip &lt;- nyc_shp_EMS$ZCTA5CE20[lengths(st_intersects(nyc_shp_EMS, st_buffer(sx, 1000))) &gt; 0]
+
+cat(&quot;ZIPs with a syringe service program:&quot;, paste(sort(sx_zip), collapse = &quot;, &quot;), &quot;\n&quot;)
+cat(&quot;Of which are comparison ZIPs:&quot;,
+    paste(sort(setdiff(sx_zip, geo$ZIPCODE[geo$treated == 1])), collapse = &quot;, &quot;), &quot;\n&quot;)</code></pre>
+<pre><code class="language-r">grab &lt;- function(m, pat) {
+  nm &lt;- grep(pat, names(coef(m)), value = TRUE)
+  if (!length(nm)) return(tibble(coef = NA_real_, se = NA_real_, p = NA_real_))
+  tibble(coef = coef(m)[[nm[1]]], se = se(m)[[nm[1]]], p = pvalue(m)[[nm[1]]])
+}
+
+confound_test &lt;- function(p, lab) {
+  p &lt;- p %&gt;% mutate(other_site = as.integer(ZIPCODE %in% sx_zip))
+  m_ctrl &lt;- fepois(y ~ treated:post + other_site:post | ZIPCODE + month_fe,
+                   data = p, offset = ~log(Population), cluster = ~ZIPCODE)
+  m_drop &lt;- fepois(y ~ treated:post | ZIPCODE + month_fe,
+                   data = p %&gt;% filter(treated == 1 | !ZIPCODE %in% sx_zip),
+                   offset = ~log(Population), cluster = ~ZIPCODE)
+  bind_rows(
+    tibble(outcome = lab, spec = &quot;Control for other sites&quot;) %&gt;% bind_cols(grab(m_ctrl, &quot;treated&quot;)),
+    tibble(outcome = lab, spec = &quot;Other-site coefficient&quot;)  %&gt;% bind_cols(grab(m_ctrl, &quot;other_site&quot;)),
+    tibble(outcome = lab, spec = &quot;Drop those ZIPs&quot;)         %&gt;% bind_cols(grab(m_drop, &quot;treated&quot;)))
+}
+
+bind_rows(confound_test(ems_es, &quot;EMS calls&quot;),
+          confound_test(syr_es, &quot;311 syringes&quot;)) %&gt;%
+  mutate(pct = round(100*(exp(coef)-1), 1),
+         lo  = round(100*(exp(coef - 1.96*se)-1), 1),
+         hi  = round(100*(exp(coef + 1.96*se)-1), 1),
+         across(c(coef, se, p), \(x) round(x, 4))) %&gt;%
+  knitr::kable(caption = &quot;Sensitivity to other harm-reduction sites&quot;)</code></pre>
+<h3>5. Table 4 at the correct scaling</h3>
+<pre><code class="language-r">rng &lt;- max(socio_dat$non_white, na.rm = TRUE)
+scale_note &lt;- dplyr::case_when(rng &lt;= 1.5 ~ &quot;proportion (0-1)&quot;,
+                               rng &lt;= 15  ~ &quot;tens of percentage points (0-10)&quot;,
+                               TRUE       ~ &quot;percentage (0-100)&quot;)
+mult_pct &lt;- dplyr::case_when(rng &lt;= 1.5 ~ 0.10, rng &lt;= 15 ~ 1, TRUE ~ 10)
+cat(&quot;non_white is on the&quot;, scale_note, &quot;scale; using multiplier&quot;, mult_pct, &quot;\n&quot;)
+
+ct &lt;- summary(socio_model)$coefficients
+table4 &lt;- tibble(term = rownames(ct)[-1], b = ct[-1, 1],
+                 se = ct[-1, 2], p = ct[-1, 4]) %&gt;%
+  mutate(unit  = ifelse(term == &quot;Median_age&quot;, &quot;per year&quot;, &quot;per 10 percentage points&quot;),
+         mult  = ifelse(term == &quot;Median_age&quot;, 1, mult_pct),
+         OR    = exp(mult * b),
+         OR_lo = exp(mult * (b - 1.96*se)),
+         OR_hi = exp(mult * (b + 1.96*se)))
+
+table4 %&gt;%
+  transmute(Variable = term, Unit = unit,
+            `b (SE)` = sprintf(&quot;%.3f (%.3f)&quot;, b, se),
+            `OR [95% CI]` = sprintf(&quot;%.3f [%.3f, %.3f]&quot;, OR, OR_lo, OR_hi),
+            p = sprintf(&quot;%.3f&quot;, p)) %&gt;%
+  knitr::kable(caption = &quot;Table 4, regenerated from the fitted model&quot;)</code></pre>
+<pre><code class="language-r">png(&quot;fig4_ems_full.png&quot;, width = 2700, height = 1500, res = 300)
+iplot(es_ems_full, main = &quot;EMS drug-related calls, full study period&quot;,
+      xlab = &quot;Months relative to SCS opening&quot;,
+      ylab = &quot;Log rate ratio vs. month -1&quot;)
+dev.off()</code></pre>
+<pre><code class="language-r">png(&quot;fig5_ems_covid_excl.png&quot;, width = 2700, height = 1500, res = 300)
+iplot(es_ems, main = &quot;EMS drug-related calls, pandemic months excluded&quot;,
+      xlab = &quot;Months relative to SCS opening&quot;,
+      ylab = &quot;Log rate ratio vs. month -1&quot;)
+dev.off()</code></pre>
+<pre><code class="language-r">es_syr_full &lt;- fit_es(syr_full)
+iplot(es_syr_full, main = &quot;311 syringe complaints, full study period&quot;,
+      xlab = &quot;Months relative to SCS opening&quot;,
+      ylab = &quot;Log rate ratio vs. month -1&quot;)</code></pre>
+<pre><code class="language-r">library(ggplot2)
+dir.create(&quot;figures&quot;, showWarnings = FALSE)
+
+save_base &lt;- function(n, expr, w = 9, h = 5) {
+  f &lt;- file.path(&quot;figures&quot;, paste0(&quot;Fig &quot;, n))
+  pdf(paste0(f, &quot;.pdf&quot;), width = w, height = h)
+  expr; dev.off()
+  png(paste0(f, &quot;.png&quot;), width = w, height = h, units = &quot;in&quot;, res = 600, type = &quot;quartz&quot;)
+  expr; dev.off()
+}
+
+save_gg &lt;- function(n, plot, w = 6, h = 8) {
+  f &lt;- file.path(&quot;figures&quot;, paste0(&quot;Fig &quot;, n))
+  ggsave(paste0(f, &quot;.pdf&quot;), plot, width = w, height = h)        # uses pdf()
+  ggsave(paste0(f, &quot;.png&quot;), plot, width = w, height = h, dpi = 600, bg = &quot;white&quot;)
+}
+
+save_base(6, iplot(es_ems_full,
+  main = &quot;EMS drug-related calls, full study period&quot;,
+  xlab = &quot;Months relative to SCS opening&quot;,
+  ylab = &quot;Log rate ratio vs. month -1&quot;))
+
+save_base(7, iplot(es_ems,
+  main = &quot;EMS drug-related calls, pandemic months excluded&quot;,
+  xlab = &quot;Months relative to SCS opening&quot;,
+  ylab = &quot;Log rate ratio vs. month -1&quot;))
+
+save_gg(3, p_map)    # choropleth — assign your Figure 3 ggplot to p_map
+save_gg(4, p_lisa)
+save_gg(5, p_lisa_syr)</code></pre>
+</div><script>hljs.highlightAll();</script></body></html>
